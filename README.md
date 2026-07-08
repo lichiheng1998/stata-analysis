@@ -48,7 +48,7 @@ $env:HF_HOME='D:\Stata-Projects\DigitalWordCounts\.hf-cache'
   --progress-every 25
 ```
 
-Add `--verbose` to enable debug logs for task discovery, preprocessing, GPU batch flushing, and batch encoding details.
+By default, logging is intentionally compact: startup, periodic progress, exports, and errors. Add `--verbose` to enable per-report and per-GPU-batch debug logs for task discovery, preprocessing, GPU batch flushing, and batch encoding details.
 
 Outputs are written under `output/`:
 

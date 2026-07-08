@@ -738,7 +738,7 @@ def run_pipeline(args):
                 save_matches=args.save_matches,
                 sample_per_report=args.sample_per_report,
             )
-            logging.info(
+            logging.debug(
                 "GPU_BATCH reports=%s sentences=%s elapsed=%.2fs avg_report=%.2fs",
                 len(batch),
                 batch_sentence_count,
@@ -751,7 +751,7 @@ def run_pipeline(args):
                     save_result(conn, report_row, match_rows)
                     mark_status(conn, task, "done")
                     completed += 1
-                    logging.info(
+                    logging.debug(
                         "DONE %s %s sentences=%s digital=%s max=%.4f",
                         task.stock_id,
                         task.year,
@@ -807,7 +807,7 @@ def run_pipeline(args):
         task = run_tasks[next_task_idx]
         next_task_idx += 1
         mark_status(conn, task, "running")
-        logging.info("START %s %s %s", task.stock_id, task.year, task.path)
+        logging.debug("START %s %s %s", task.stock_id, task.year, task.path)
         future = executor.submit(prepare_report, task)
         futures[future] = task
 
@@ -822,7 +822,7 @@ def run_pipeline(args):
                 submit_next(executor)
                 try:
                     prepared = future.result()
-                    logging.info(
+                    logging.debug(
                         "PREPARED %s %s sentences=%s buffer_reports=%s buffer_sentences=%s",
                         task.stock_id,
                         task.year,
