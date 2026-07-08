@@ -2,6 +2,11 @@
 
 Scripts for measuring digitalization-related content in annual MD&A text files using Chinese sentence segmentation and BGE embeddings.
 
+Matching uses an OR rule:
+
+- sentence contains any term in `digital_keywords.txt`, or
+- sentence's best topic embedding similarity is at least `--threshold`.
+
 ## Environment
 
 Create or sync a Python environment with `uv`:
@@ -37,6 +42,7 @@ $env:HF_HOME='D:\Stata-Projects\DigitalWordCounts\.hf-cache'
   --start-year 2023 `
   --end-year 2025 `
   --threshold 0.62 `
+  --keyword-path .\digital_keywords.txt `
   --batch-size 128 `
   --gpu-report-batch-size 16 `
   --max-gpu-sentences 8192 `
@@ -49,6 +55,8 @@ $env:HF_HOME='D:\Stata-Projects\DigitalWordCounts\.hf-cache'
 ```
 
 By default, logging is intentionally compact: startup, periodic progress, exports, and errors. Add `--verbose` to enable per-report and per-GPU-batch debug logs for task discovery, preprocessing, GPU batch flushing, and batch encoding details.
+
+Use `--disable-keyword-match` to run embedding-threshold-only matching.
 
 Outputs are written under `output/`:
 

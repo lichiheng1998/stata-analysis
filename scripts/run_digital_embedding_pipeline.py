@@ -19,6 +19,7 @@ from FlagEmbedding import FlagModel
 ROOT = Path(__file__).resolve().parents[1]
 TEXT_ROOT = ROOT / "txt 2001-2025" / "管理层讨论与分析"
 THEME_PATH = ROOT / "数字化主题向量列表.txt"
+DEFAULT_KEYWORD_PATH = ROOT / "digital_keywords.txt"
 DEFAULT_OUTPUT_DIR = ROOT / "output"
 DEFAULT_LOG_DIR = ROOT / "logs"
 MODEL_NAME = "BAAI/bge-base-zh-v1.5"
@@ -53,6 +54,8 @@ MATCH_FIELDS = [
     "theme_id",
     "theme_name",
     "is_digital",
+    "matched_keywords",
+    "match_method",
 ]
 
 
@@ -95,6 +98,12 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model-name", default=MODEL_NAME)
+    parser.add_argument("--keyword-path", type=Path, default=DEFAULT_KEYWORD_PATH)
+    parser.add_argument(
+        "--disable-keyword-match",
+        action="store_true",
+        help="Only use embedding threshold; ignore keyword lexicon matches.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     parser.add_argument("--resume", action="store_true", help="Skip completed reports.")
@@ -187,12 +196,22 @@ def connect_state(db_path: Path):
             theme_id TEXT NOT NULL,
             theme_name TEXT NOT NULL,
             is_digital INTEGER NOT NULL,
+            matched_keywords TEXT NOT NULL DEFAULT '',
+            match_method TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (file_path, sentence_id)
         )
         """
     )
+    ensure_column(conn, "sentence_matches", "matched_keywords", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "sentence_matches", "match_method", "TEXT NOT NULL DEFAULT ''")
     conn.commit()
     return conn
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str):
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def utcnow():
@@ -209,6 +228,44 @@ def load_themes():
         raise RuntimeError(f"No themes loaded from {THEME_PATH}")
     logging.debug("Loaded %s themes from %s", len(themes), THEME_PATH)
     return themes
+
+
+def load_keywords(path: Path, disabled: bool):
+    if disabled:
+        logging.info("Keyword lexicon matching disabled.")
+        return []
+    if not path.exists():
+        logging.warning("Keyword lexicon not found: %s; embedding-only matching will be used.", path)
+        return []
+    keywords = []
+    seen = set()
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        keyword = line.strip()
+        if keyword and keyword not in seen:
+            seen.add(keyword)
+            keywords.append(keyword)
+    keywords.sort(key=len, reverse=True)
+    logging.info("Loaded keyword lexicon: %s terms from %s", len(keywords), path)
+    logging.debug("Keyword lexicon terms: %s", keywords)
+    return keywords
+
+
+def keyword_hits(sentence: str, keywords: list[str]):
+    if not keywords:
+        return []
+    return [keyword for keyword in keywords if keyword in sentence]
+
+
+def classify_match(score: float, threshold: float, hits: list[str]):
+    embedding_hit = score >= threshold
+    keyword_hit = bool(hits)
+    if embedding_hit and keyword_hit:
+        return True, "both"
+    if keyword_hit:
+        return True, "keyword"
+    if embedding_hit:
+        return True, "embedding"
+    return False, ""
 
 
 def discover_tasks(start_year: int, end_year: int, limit: int | None):
@@ -360,6 +417,7 @@ def process_prepared(
     theme_emb: np.ndarray,
     themes: list[dict],
     threshold: float,
+    keywords: list[str],
     batch_size: int,
     save_matches: str,
     sample_per_report: int,
@@ -391,7 +449,13 @@ def process_prepared(
     sims = sent_emb @ theme_emb.T
     best_theme_idx = sims.argmax(axis=1)
     best_scores = sims.max(axis=1)
-    is_digital = best_scores >= threshold
+    sentence_keyword_hits = [keyword_hits(sentence, keywords) for sentence in prepared.sentences]
+    classifications = [
+        classify_match(float(score), threshold, hits)
+        for score, hits in zip(best_scores, sentence_keyword_hits)
+    ]
+    is_digital = np.array([matched for matched, _ in classifications], dtype=bool)
+    match_methods = [method for _, method in classifications]
 
     sentence_chars = np.array([len(sentence) for sentence in prepared.sentences], dtype=np.int64)
     digital_chars = int(sentence_chars[is_digital].sum())
@@ -442,6 +506,8 @@ def process_prepared(
                     "theme_id": theme["id"],
                     "theme_name": theme["name"],
                     "is_digital": int(bool(is_digital[idx])),
+                    "matched_keywords": "、".join(sentence_keyword_hits[idx]),
+                    "match_method": match_methods[idx],
                 }
             )
 
@@ -454,6 +520,7 @@ def build_report_outputs(
     theme_emb: np.ndarray,
     themes: list[dict],
     threshold: float,
+    keywords: list[str],
     save_matches: str,
     sample_per_report: int,
 ):
@@ -482,7 +549,13 @@ def build_report_outputs(
     sims = sent_emb @ theme_emb.T
     best_theme_idx = sims.argmax(axis=1)
     best_scores = sims.max(axis=1)
-    is_digital = best_scores >= threshold
+    sentence_keyword_hits = [keyword_hits(sentence, keywords) for sentence in prepared.sentences]
+    classifications = [
+        classify_match(float(score), threshold, hits)
+        for score, hits in zip(best_scores, sentence_keyword_hits)
+    ]
+    is_digital = np.array([matched for matched, _ in classifications], dtype=bool)
+    match_methods = [method for _, method in classifications]
 
     sentence_chars = np.array([len(sentence) for sentence in prepared.sentences], dtype=np.int64)
     digital_chars = int(sentence_chars[is_digital].sum())
@@ -533,6 +606,8 @@ def build_report_outputs(
                     "theme_id": theme["id"],
                     "theme_name": theme["name"],
                     "is_digital": int(bool(is_digital[idx])),
+                    "matched_keywords": "、".join(sentence_keyword_hits[idx]),
+                    "match_method": match_methods[idx],
                 }
             )
 
@@ -545,6 +620,7 @@ def process_prepared_batch(
     theme_emb: np.ndarray,
     themes: list[dict],
     threshold: float,
+    keywords: list[str],
     batch_size: int,
     save_matches: str,
     sample_per_report: int,
@@ -582,6 +658,7 @@ def process_prepared_batch(
             theme_emb=theme_emb,
             themes=themes,
             threshold=threshold,
+            keywords=keywords,
             save_matches=save_matches,
             sample_per_report=sample_per_report,
         )
@@ -614,11 +691,13 @@ def save_result(conn: sqlite3.Connection, report_row: dict, match_rows: list[dic
             """
             INSERT OR REPLACE INTO sentence_matches (
                 file_path, stock_id, year, sentence_id, sentence, char_count,
-                max_score, theme_id, theme_name, is_digital
+                max_score, theme_id, theme_name, is_digital,
+                matched_keywords, match_method
             )
             VALUES (
                 :file_path, :stock_id, :year, :sentence_id, :sentence, :char_count,
-                :max_score, :theme_id, :theme_name, :is_digital
+                :max_score, :theme_id, :theme_name, :is_digital,
+                :matched_keywords, :match_method
             )
             """,
             match_rows,
@@ -643,7 +722,7 @@ def export_csv(conn: sqlite3.Connection, output_dir: Path):
         MATCH_FIELDS,
         """
         SELECT stock_id, year, sentence_id, sentence, char_count, max_score,
-               theme_id, theme_name, is_digital
+               theme_id, theme_name, is_digital, matched_keywords, match_method
         FROM sentence_matches
         ORDER BY year, stock_id, file_path, sentence_id
         """,
@@ -677,6 +756,7 @@ def run_pipeline(args):
         return
 
     themes = load_themes()
+    keywords = load_keywords(args.keyword_path, args.disable_keyword_match)
     tasks = discover_tasks(args.start_year, args.end_year, args.limit)
     logging.info("Discovered annual reports: %s", len(tasks))
     initialize_tasks(conn, tasks, args.force)
@@ -734,6 +814,7 @@ def run_pipeline(args):
                 theme_emb=theme_emb,
                 themes=themes,
                 threshold=args.threshold,
+                keywords=keywords,
                 batch_size=args.batch_size,
                 save_matches=args.save_matches,
                 sample_per_report=args.sample_per_report,
