@@ -15,6 +15,11 @@ import numpy as np
 import pysbd
 from FlagEmbedding import FlagModel
 
+try:
+    import jieba
+except ImportError:
+    jieba = None
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT_ROOT = ROOT / "txt 2001-2025" / "管理层讨论与分析"
@@ -25,6 +30,22 @@ DEFAULT_LOG_DIR = ROOT / "logs"
 MODEL_NAME = "BAAI/bge-base-zh-v1.5"
 ANNUAL_RE = re.compile(r"^(?P<stock_id>\d{6})_(?P<report_date>(?P<year>\d{4})-12-31)\.txt$")
 MIN_SENTENCE_CHARS = 8
+WEAK_KEYWORDS = {
+    "\u4fe1\u606f",  # 信息
+    "\u6570\u636e",  # 数据
+    "\u667a\u80fd",  # 智能
+    "\u8054\u7f51",  # 联网
+    "\u901a\u4fe1",  # 通信
+    "\u673a\u5668",  # 机器
+    "\u4ea7\u4e1a\u94fe",  # 产业链
+    "\u4ea7\u5b66\u7814",  # 产学研
+    "\u5173\u952e\u6280\u672f",  # 关键技术
+    "\u6838\u5fc3\u6280\u672f",  # 核心技术
+    "\u6280\u672f\u5f00\u53d1",  # 技术开发
+    "\u6280\u672f\u6539\u9020",  # 技术改造
+    "\u7535\u52a8",  # 电动
+    "\u8054\u901a",  # 联通
+}
 
 REPORT_FIELDS = [
     "stock_id",
@@ -98,11 +119,39 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model-name", default=MODEL_NAME)
+    parser.add_argument(
+        "--exclude-theme-ids",
+        default="",
+        help="Comma-separated theme ids to exclude from embedding matching, e.g. D14.",
+    )
     parser.add_argument("--keyword-path", type=Path, default=DEFAULT_KEYWORD_PATH)
     parser.add_argument(
         "--disable-keyword-match",
         action="store_true",
         help="Only use embedding threshold; ignore keyword lexicon matches.",
+    )
+    parser.add_argument(
+        "--keyword-match-mode",
+        choices=["strict", "any"],
+        default="strict",
+        help="strict ignores generic standalone terms such as 数据/信息; any matches every keyword.",
+    )
+    parser.add_argument(
+        "--keyword-tokenizer",
+        choices=["jieba", "substring"],
+        default="jieba",
+        help="Use jieba token matching for keyword hits, or raw substring matching.",
+    )
+    parser.add_argument(
+        "--match-rule",
+        choices=[
+            "keyword-or-embedding",
+            "keyword-only",
+            "embedding-only",
+            "keyword-and-embedding",
+        ],
+        default="keyword-or-embedding",
+        help="Control whether keyword hits, embedding hits, or both define a matched sentence.",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
@@ -218,14 +267,23 @@ def utcnow():
     return datetime.utcnow().isoformat(timespec="seconds")
 
 
-def load_themes():
+def parse_theme_ids(value: str):
+    return {part.strip() for part in value.split(",") if part.strip()}
+
+
+def load_themes(exclude_theme_ids: set[str] | None = None):
+    exclude_theme_ids = exclude_theme_ids or set()
     themes = []
     for line in THEME_PATH.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if line:
-            themes.append(json.loads(line))
+            theme = json.loads(line)
+            if theme.get("id") not in exclude_theme_ids:
+                themes.append(theme)
     if not themes:
         raise RuntimeError(f"No themes loaded from {THEME_PATH}")
+    if exclude_theme_ids:
+        logging.info("Excluded theme ids from embedding matching: %s", sorted(exclude_theme_ids))
     logging.debug("Loaded %s themes from %s", len(themes), THEME_PATH)
     return themes
 
@@ -250,22 +308,64 @@ def load_keywords(path: Path, disabled: bool):
     return keywords
 
 
-def keyword_hits(sentence: str, keywords: list[str]):
+def register_jieba_keywords(keywords: list[str], tokenizer: str):
+    if tokenizer != "jieba" or not keywords:
+        return
+    if jieba is None:
+        raise RuntimeError("jieba is required when --keyword-tokenizer jieba is used.")
+    for keyword in keywords:
+        jieba.add_word(keyword)
+    logging.info("Registered %s keyword terms in jieba dictionary.", len(keywords))
+
+
+def tokenize_sentence(sentence: str):
+    if jieba is None:
+        raise RuntimeError("jieba is required when --keyword-tokenizer jieba is used.")
+    return {token.strip() for token in jieba.lcut(sentence) if token.strip()}
+
+
+def keyword_hits(sentence: str, keywords: list[str], match_mode: str, tokenizer: str):
     if not keywords:
         return []
-    return [keyword for keyword in keywords if keyword in sentence]
+
+    if tokenizer == "jieba":
+        tokens = tokenize_sentence(sentence)
+        hits = [
+            keyword
+            for keyword in keywords
+            if (keyword in tokens if len(keyword) <= 3 else keyword in sentence)
+        ]
+    else:
+        hits = [keyword for keyword in keywords if keyword in sentence]
+
+    if match_mode == "any":
+        return hits
+    strong_hits = [keyword for keyword in hits if keyword not in WEAK_KEYWORDS]
+    if strong_hits:
+        return hits
+    return []
 
 
-def classify_match(score: float, threshold: float, hits: list[str]):
+def classify_match(score: float, threshold: float, hits: list[str], match_rule: str):
     embedding_hit = score >= threshold
     keyword_hit = bool(hits)
+
+    if match_rule == "keyword-only":
+        matched = keyword_hit
+    elif match_rule == "embedding-only":
+        matched = embedding_hit
+    elif match_rule == "keyword-and-embedding":
+        matched = keyword_hit and embedding_hit
+    else:
+        matched = keyword_hit or embedding_hit
+
+    if not matched:
+        return False, ""
     if embedding_hit and keyword_hit:
         return True, "both"
     if keyword_hit:
         return True, "keyword"
-    if embedding_hit:
-        return True, "embedding"
-    return False, ""
+    return True, "embedding"
 
 
 def discover_tasks(start_year: int, end_year: int, limit: int | None):
@@ -418,6 +518,9 @@ def process_prepared(
     themes: list[dict],
     threshold: float,
     keywords: list[str],
+    keyword_match_mode: str,
+    keyword_tokenizer: str,
+    match_rule: str,
     batch_size: int,
     save_matches: str,
     sample_per_report: int,
@@ -449,9 +552,12 @@ def process_prepared(
     sims = sent_emb @ theme_emb.T
     best_theme_idx = sims.argmax(axis=1)
     best_scores = sims.max(axis=1)
-    sentence_keyword_hits = [keyword_hits(sentence, keywords) for sentence in prepared.sentences]
+    sentence_keyword_hits = [
+        keyword_hits(sentence, keywords, keyword_match_mode, keyword_tokenizer)
+        for sentence in prepared.sentences
+    ]
     classifications = [
-        classify_match(float(score), threshold, hits)
+        classify_match(float(score), threshold, hits, match_rule)
         for score, hits in zip(best_scores, sentence_keyword_hits)
     ]
     is_digital = np.array([matched for matched, _ in classifications], dtype=bool)
@@ -521,6 +627,9 @@ def build_report_outputs(
     themes: list[dict],
     threshold: float,
     keywords: list[str],
+    keyword_match_mode: str,
+    keyword_tokenizer: str,
+    match_rule: str,
     save_matches: str,
     sample_per_report: int,
 ):
@@ -546,12 +655,19 @@ def build_report_outputs(
         }
         return report_row, []
 
-    sims = sent_emb @ theme_emb.T
-    best_theme_idx = sims.argmax(axis=1)
-    best_scores = sims.max(axis=1)
-    sentence_keyword_hits = [keyword_hits(sentence, keywords) for sentence in prepared.sentences]
+    if sent_emb is None:
+        best_theme_idx = np.full(len(prepared.sentences), -1, dtype=np.int64)
+        best_scores = np.zeros(len(prepared.sentences), dtype=np.float32)
+    else:
+        sims = sent_emb @ theme_emb.T
+        best_theme_idx = sims.argmax(axis=1)
+        best_scores = sims.max(axis=1)
+    sentence_keyword_hits = [
+        keyword_hits(sentence, keywords, keyword_match_mode, keyword_tokenizer)
+        for sentence in prepared.sentences
+    ]
     classifications = [
-        classify_match(float(score), threshold, hits)
+        classify_match(float(score), threshold, hits, match_rule)
         for score, hits in zip(best_scores, sentence_keyword_hits)
     ]
     is_digital = np.array([matched for matched, _ in classifications], dtype=bool)
@@ -561,7 +677,11 @@ def build_report_outputs(
     digital_chars = int(sentence_chars[is_digital].sum())
     digital_sentences = int(is_digital.sum())
     top_idx = int(best_scores.argmax())
-    top_theme = themes[int(best_theme_idx[top_idx])]
+    top_theme = (
+        themes[int(best_theme_idx[top_idx])]
+        if int(best_theme_idx[top_idx]) >= 0
+        else {"id": "", "name": ""}
+    )
     digital_scores = best_scores[is_digital]
 
     report_row = {
@@ -593,7 +713,11 @@ def build_report_outputs(
             indices = digital_indices[:sample_per_report]
 
         for idx in indices:
-            theme = themes[int(best_theme_idx[idx])]
+            theme = (
+                themes[int(best_theme_idx[idx])]
+                if int(best_theme_idx[idx]) >= 0
+                else {"id": "", "name": ""}
+            )
             match_rows.append(
                 {
                     "file_path": str(task.path),
@@ -621,6 +745,9 @@ def process_prepared_batch(
     themes: list[dict],
     threshold: float,
     keywords: list[str],
+    keyword_match_mode: str,
+    keyword_tokenizer: str,
+    match_rule: str,
     batch_size: int,
     save_matches: str,
     sample_per_report: int,
@@ -629,7 +756,7 @@ def process_prepared_batch(
     nonempty = [prepared for prepared in prepared_reports if prepared.sentences]
     embeddings_by_path = {}
 
-    if nonempty:
+    if nonempty and model is not None:
         all_sentences = []
         spans = []
         offset = 0
@@ -659,6 +786,9 @@ def process_prepared_batch(
             themes=themes,
             threshold=threshold,
             keywords=keywords,
+            keyword_match_mode=keyword_match_mode,
+            keyword_tokenizer=keyword_tokenizer,
+            match_rule=match_rule,
             save_matches=save_matches,
             sample_per_report=sample_per_report,
         )
@@ -747,6 +877,9 @@ def count_status(conn: sqlite3.Connection):
 
 
 def run_pipeline(args):
+    if args.keyword_tokenizer == "jieba" and jieba is None and not args.disable_keyword_match:
+        raise RuntimeError("Install jieba or use --keyword-tokenizer substring.")
+
     output_dir = args.output_dir
     db_path = output_dir / "pipeline_state.sqlite"
     conn = connect_state(db_path)
@@ -755,8 +888,11 @@ def run_pipeline(args):
         export_csv(conn, output_dir)
         return
 
-    themes = load_themes()
+    uses_embedding = args.match_rule != "keyword-only"
+    exclude_theme_ids = parse_theme_ids(args.exclude_theme_ids)
+    themes = load_themes(exclude_theme_ids) if uses_embedding else []
     keywords = load_keywords(args.keyword_path, args.disable_keyword_match)
+    register_jieba_keywords(keywords, args.keyword_tokenizer)
     tasks = discover_tasks(args.start_year, args.end_year, args.limit)
     logging.info("Discovered annual reports: %s", len(tasks))
     initialize_tasks(conn, tasks, args.force)
@@ -767,8 +903,15 @@ def run_pipeline(args):
         export_csv(conn, output_dir)
         return
 
-    model = build_model(args.model_name, args.device)
-    theme_emb = normalize(model.encode([theme["vector_text"] for theme in themes], batch_size=len(themes)))
+    if uses_embedding:
+        model = build_model(args.model_name, args.device)
+        theme_emb = normalize(
+            model.encode([theme["vector_text"] for theme in themes], batch_size=len(themes))
+        )
+    else:
+        logging.info("Keyword-only mode: skipping model load and embedding inference.")
+        model = None
+        theme_emb = None
 
     completed = 0
     failed = 0
@@ -815,6 +958,9 @@ def run_pipeline(args):
                 themes=themes,
                 threshold=args.threshold,
                 keywords=keywords,
+                keyword_match_mode=args.keyword_match_mode,
+                keyword_tokenizer=args.keyword_tokenizer,
+                match_rule=args.match_rule,
                 batch_size=args.batch_size,
                 save_matches=args.save_matches,
                 sample_per_report=args.sample_per_report,

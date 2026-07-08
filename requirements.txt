@@ -1,4 +1,5 @@
 FlagEmbedding==1.4.0
+jieba==0.42.1
 numpy==2.4.6
 pandas==3.0.3
 pyarrow==24.0.0
