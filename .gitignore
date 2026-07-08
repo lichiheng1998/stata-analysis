@@ -1,0 +1,21 @@
+.venv/
+.uv-cache/
+.uv-python/
+.hf-cache/
+
+__pycache__/
+*.py[cod]
+
+logs/
+logs_batch_test/
+output/
+output_batch_test/
+
+txt 2001-2025/
+*.zip
+*.xlsx
+*.xls
+*.pdf
+
+sample_embedding_matches.txt
+sample_pysbd_sentences_*.txt

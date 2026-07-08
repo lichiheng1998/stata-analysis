@@ -1,0 +1,51 @@
+# DigitalWordCounts
+
+Scripts for measuring digitalization-related content in annual MD&A text files using Chinese sentence segmentation and BGE embeddings.
+
+## Environment
+
+Create or sync a Python environment with `uv`:
+
+```powershell
+uv venv .venv --python 3.11 --seed
+uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu126
+```
+
+The pipeline expects `BAAI/bge-base-zh-v1.5` and can cache Hugging Face files inside the project:
+
+```powershell
+$env:HF_HOME='D:\Stata-Projects\DigitalWordCounts\.hf-cache'
+```
+
+## Annual Pipeline
+
+Run annual-only reports for 2023-2025:
+
+```powershell
+cd D:\Stata-Projects\DigitalWordCounts
+
+$env:PYTHONIOENCODING='utf-8'
+$env:HF_HOME='D:\Stata-Projects\DigitalWordCounts\.hf-cache'
+
+.\.venv\Scripts\python.exe scripts\run_digital_embedding_pipeline.py `
+  --start-year 2023 `
+  --end-year 2025 `
+  --threshold 0.62 `
+  --batch-size 128 `
+  --gpu-report-batch-size 16 `
+  --max-gpu-sentences 8192 `
+  --num-workers 4 `
+  --device cuda:0 `
+  --resume `
+  --save-matches sample `
+  --sample-per-report 20 `
+  --progress-every 25
+```
+
+Outputs are written under `output/`:
+
+- `pipeline_state.sqlite`
+- `digital_report_level_annual.csv`
+- `digital_sentence_matches_annual.csv`
+
+Input data folders, virtual environments, model caches, logs, and outputs are ignored by Git.
