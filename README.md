@@ -8,13 +8,19 @@ Create or sync a Python environment with `uv`:
 
 ```powershell
 uv venv .venv --python 3.11 --seed
-uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu126
+uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt
 ```
 
 The pipeline expects `BAAI/bge-base-zh-v1.5` and can cache Hugging Face files inside the project:
 
 ```powershell
 $env:HF_HOME='D:\Stata-Projects\DigitalWordCounts\.hf-cache'
+```
+
+If you need a specific CUDA PyTorch build, install PyTorch from the official PyTorch index before or after installing `requirements.txt`, for example:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu126
 ```
 
 ## Annual Pipeline
