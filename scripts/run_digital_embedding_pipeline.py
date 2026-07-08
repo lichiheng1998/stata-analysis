@@ -109,6 +109,7 @@ def parse_args():
     )
     parser.add_argument("--sample-per-report", type=int, default=20)
     parser.add_argument("--progress-every", type=int, default=25)
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     parser.add_argument(
         "--export-only",
         action="store_true",
@@ -117,11 +118,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def setup_logging(log_dir: Path):
+def setup_logging(log_dir: Path, verbose: bool):
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"digital_pipeline_{datetime.now():%Y%m%d_%H%M%S}.log"
+    level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[
             logging.StreamHandler(),
@@ -129,6 +131,7 @@ def setup_logging(log_dir: Path):
         ],
     )
     logging.info("Log file: %s", log_path)
+    logging.debug("Verbose logging enabled.")
 
 
 def connect_state(db_path: Path):
@@ -204,6 +207,7 @@ def load_themes():
             themes.append(json.loads(line))
     if not themes:
         raise RuntimeError(f"No themes loaded from {THEME_PATH}")
+    logging.debug("Loaded %s themes from %s", len(themes), THEME_PATH)
     return themes
 
 
@@ -227,7 +231,14 @@ def discover_tasks(start_year: int, end_year: int, limit: int | None):
                 )
             )
             if limit is not None and len(tasks) >= limit:
+                logging.debug("Discovery stopped at limit=%s", limit)
                 return tasks
+    logging.debug(
+        "Discovered %s annual report tasks from %s to %s",
+        len(tasks),
+        start_year,
+        end_year,
+    )
     return tasks
 
 
@@ -254,6 +265,7 @@ def initialize_tasks(conn: sqlite3.Connection, tasks: list[Task], force: bool):
     )
     conn.execute("UPDATE tasks SET status='pending', updated_at=? WHERE status='running'", (now,))
     conn.commit()
+    logging.debug("Initialized/kept %s tasks in SQLite state.", len(tasks))
 
 
 def select_tasks(
@@ -311,9 +323,18 @@ def split_sentences(text: str):
 
 
 def prepare_report(task: Task):
+    start = time.perf_counter()
     text = task.path.read_text(encoding="utf-8-sig", errors="ignore")
     total_chars = len(clean_text(text))
     sentences = split_sentences(text)
+    logging.debug(
+        "Prepared %s %s chars=%s sentences=%s elapsed=%.3fs",
+        task.stock_id,
+        task.year,
+        total_chars,
+        len(sentences),
+        time.perf_counter() - start,
+    )
     return PreparedReport(
         task=task,
         total_chars=total_chars,
@@ -543,6 +564,12 @@ def process_prepared_batch(
             offset += count
 
         all_emb = normalize(model.encode(all_sentences, batch_size=batch_size))
+        logging.debug(
+            "Encoded GPU batch reports=%s sentences=%s batch_size=%s",
+            len(nonempty),
+            len(all_sentences),
+            batch_size,
+        )
         for prepared, start_idx, end_idx in spans:
             embeddings_by_path[str(prepared.task.path)] = all_emb[start_idx:end_idx]
 
@@ -655,6 +682,7 @@ def run_pipeline(args):
     initialize_tasks(conn, tasks, args.force)
     run_tasks = select_tasks(conn, tasks, args.resume, args.retry_failed)
     logging.info("Tasks selected for this run: %s", len(run_tasks))
+    logging.debug("Initial SQLite status: %s", count_status(conn))
     if not run_tasks:
         export_csv(conn, output_dir)
         return
@@ -679,6 +707,13 @@ def run_pipeline(args):
             and len(prepared_buffer) < max(1, args.gpu_report_batch_size)
             and prepared_sentence_count < max(1, args.max_gpu_sentences)
         ):
+            logging.debug(
+                "Holding GPU buffer reports=%s/%s sentences=%s/%s",
+                len(prepared_buffer),
+                args.gpu_report_batch_size,
+                prepared_sentence_count,
+                args.max_gpu_sentences,
+            )
             return
 
         batch = prepared_buffer
@@ -687,6 +722,12 @@ def run_pipeline(args):
         prepared_sentence_count = 0
 
         try:
+            logging.debug(
+                "Flushing GPU buffer force=%s reports=%s sentences=%s",
+                force,
+                len(batch),
+                batch_sentence_count,
+            )
             outputs, batch_elapsed = process_prepared_batch(
                 prepared_reports=batch,
                 model=model,
@@ -806,7 +847,7 @@ def run_pipeline(args):
 
 def main():
     args = parse_args()
-    setup_logging(args.log_dir)
+    setup_logging(args.log_dir, args.verbose)
     logging.info("Arguments: %s", vars(args))
     run_pipeline(args)
 

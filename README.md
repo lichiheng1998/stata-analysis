@@ -48,6 +48,8 @@ $env:HF_HOME='D:\Stata-Projects\DigitalWordCounts\.hf-cache'
   --progress-every 25
 ```
 
+Add `--verbose` to enable debug logs for task discovery, preprocessing, GPU batch flushing, and batch encoding details.
+
 Outputs are written under `output/`:
 
 - `pipeline_state.sqlite`
