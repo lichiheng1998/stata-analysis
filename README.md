@@ -4,7 +4,8 @@ Scripts for measuring digitalization-related content in annual MD&A text files u
 
 Matching uses an OR rule:
 
-- sentence contains any term in `digital_keywords.txt`, or
+- sentence contains a valid term in `digital_keywords.txt` and its best topic
+  embedding similarity is at least `--keyword-score-threshold` (default `0.5`), or
 - sentence's best topic embedding similarity is at least `--threshold`.
 
 ## Environment
@@ -42,6 +43,7 @@ $env:HF_HOME='D:\Stata-Projects\DigitalWordCounts\.hf-cache'
   --start-year 2023 `
   --end-year 2025 `
   --threshold 0.62 `
+  --keyword-score-threshold 0.5 `
   --keyword-path .\digital_keywords.txt `
   --keyword-match-mode strict `
   --keyword-tokenizer jieba `
@@ -78,6 +80,7 @@ For fast keyword-only matching without loading the embedding model:
   --keyword-match-mode strict `
   --keyword-tokenizer substring `
   --match-rule keyword-only `
+  --keyword-score-threshold 0 `
   --output-dir output_keyword_only `
   --num-workers 4 `
   --save-matches sample `

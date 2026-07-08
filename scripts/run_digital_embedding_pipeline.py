@@ -153,6 +153,12 @@ def parse_args():
         default="keyword-or-embedding",
         help="Control whether keyword hits, embedding hits, or both define a matched sentence.",
     )
+    parser.add_argument(
+        "--keyword-score-threshold",
+        type=float,
+        default=0.5,
+        help="Minimum embedding score required for keyword-hit sentences.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     parser.add_argument("--resume", action="store_true", help="Skip completed reports.")
@@ -346,24 +352,31 @@ def keyword_hits(sentence: str, keywords: list[str], match_mode: str, tokenizer:
     return []
 
 
-def classify_match(score: float, threshold: float, hits: list[str], match_rule: str):
+def classify_match(
+    score: float,
+    threshold: float,
+    keyword_score_threshold: float,
+    hits: list[str],
+    match_rule: str,
+):
     embedding_hit = score >= threshold
     keyword_hit = bool(hits)
+    keyword_score_hit = keyword_hit and score >= keyword_score_threshold
 
     if match_rule == "keyword-only":
-        matched = keyword_hit
+        matched = keyword_score_hit
     elif match_rule == "embedding-only":
         matched = embedding_hit
     elif match_rule == "keyword-and-embedding":
         matched = keyword_hit and embedding_hit
     else:
-        matched = keyword_hit or embedding_hit
+        matched = keyword_score_hit or embedding_hit
 
     if not matched:
         return False, ""
     if embedding_hit and keyword_hit:
         return True, "both"
-    if keyword_hit:
+    if keyword_score_hit:
         return True, "keyword"
     return True, "embedding"
 
@@ -517,6 +530,7 @@ def process_prepared(
     theme_emb: np.ndarray,
     themes: list[dict],
     threshold: float,
+    keyword_score_threshold: float,
     keywords: list[str],
     keyword_match_mode: str,
     keyword_tokenizer: str,
@@ -557,7 +571,7 @@ def process_prepared(
         for sentence in prepared.sentences
     ]
     classifications = [
-        classify_match(float(score), threshold, hits, match_rule)
+        classify_match(float(score), threshold, keyword_score_threshold, hits, match_rule)
         for score, hits in zip(best_scores, sentence_keyword_hits)
     ]
     is_digital = np.array([matched for matched, _ in classifications], dtype=bool)
@@ -626,6 +640,7 @@ def build_report_outputs(
     theme_emb: np.ndarray,
     themes: list[dict],
     threshold: float,
+    keyword_score_threshold: float,
     keywords: list[str],
     keyword_match_mode: str,
     keyword_tokenizer: str,
@@ -667,7 +682,7 @@ def build_report_outputs(
         for sentence in prepared.sentences
     ]
     classifications = [
-        classify_match(float(score), threshold, hits, match_rule)
+        classify_match(float(score), threshold, keyword_score_threshold, hits, match_rule)
         for score, hits in zip(best_scores, sentence_keyword_hits)
     ]
     is_digital = np.array([matched for matched, _ in classifications], dtype=bool)
@@ -744,6 +759,7 @@ def process_prepared_batch(
     theme_emb: np.ndarray,
     themes: list[dict],
     threshold: float,
+    keyword_score_threshold: float,
     keywords: list[str],
     keyword_match_mode: str,
     keyword_tokenizer: str,
@@ -785,6 +801,7 @@ def process_prepared_batch(
             theme_emb=theme_emb,
             themes=themes,
             threshold=threshold,
+            keyword_score_threshold=keyword_score_threshold,
             keywords=keywords,
             keyword_match_mode=keyword_match_mode,
             keyword_tokenizer=keyword_tokenizer,
@@ -888,7 +905,7 @@ def run_pipeline(args):
         export_csv(conn, output_dir)
         return
 
-    uses_embedding = args.match_rule != "keyword-only"
+    uses_embedding = args.match_rule != "keyword-only" or args.keyword_score_threshold > 0
     exclude_theme_ids = parse_theme_ids(args.exclude_theme_ids)
     themes = load_themes(exclude_theme_ids) if uses_embedding else []
     keywords = load_keywords(args.keyword_path, args.disable_keyword_match)
@@ -909,7 +926,9 @@ def run_pipeline(args):
             model.encode([theme["vector_text"] for theme in themes], batch_size=len(themes))
         )
     else:
-        logging.info("Keyword-only mode: skipping model load and embedding inference.")
+        logging.info(
+            "Keyword-only mode with keyword_score_threshold<=0: skipping model load and embedding inference."
+        )
         model = None
         theme_emb = None
 
@@ -957,6 +976,7 @@ def run_pipeline(args):
                 theme_emb=theme_emb,
                 themes=themes,
                 threshold=args.threshold,
+                keyword_score_threshold=args.keyword_score_threshold,
                 keywords=keywords,
                 keyword_match_mode=args.keyword_match_mode,
                 keyword_tokenizer=args.keyword_tokenizer,
